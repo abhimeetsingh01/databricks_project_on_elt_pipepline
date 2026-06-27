@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from time import perf_counter
 
 import numpy as np
@@ -64,157 +63,100 @@ class PipelineProfile:
         return self.landing_seconds + self.silver_seconds + self.gold_seconds
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _read_csv(path: Path, **kwargs) -> pd.DataFrame:
-    return pd.read_csv(path, low_memory=False, **kwargs)
-
-
 def load_commerce_data() -> tuple[pd.DataFrame, PipelineProfile]:
-    root = _repo_root() / "0_data" / "ecomm-raw-data"
-
-    landing_start = perf_counter()
-    order_files = sorted((root / "order_items" / "landing").glob("*.csv"))
-    frames = []
-    for path in order_files:
-        frame = _read_csv(path, dtype=str)
-        frame["source_file"] = path.name
-        frames.append(frame)
-    landing = pd.concat(frames, ignore_index=True)
-    landing_seconds = perf_counter() - landing_start
-
-    duplicate_count = int(landing.duplicated(["order_id", "item_seq"]).sum())
-    text_quantity_count = int((landing["quantity"].str.lower() == "two").sum())
-    invalid_price_count = int(
-        pd.to_numeric(landing["unit_price"].str.replace("$", "", regex=False), errors="coerce")
-        .isna()
-        .sum()
+    """Load data from Unity Catalog denormalized table."""
+    from databricks import sql
+    import os
+    
+    load_start = perf_counter()
+    
+    # Connect to Databricks SQL using app credentials
+    conn = sql.connect(
+        server_hostname=os.getenv("DATABRICKS_HOST"),
+        http_path=os.getenv("DATABRICKS_WAREHOUSE_HTTP_PATH", "/sql/1.0/warehouses/f9a03c44e80b62a1")
     )
-    missing_customer_count = int(landing["customer_id"].isna().sum())
-
-    silver_start = perf_counter()
-    silver = landing.drop_duplicates(["order_id", "item_seq"]).copy()
-    silver["transaction_date"] = pd.to_datetime(silver["dt"], errors="coerce")
-    silver["transaction_ts"] = pd.to_datetime(silver["order_ts"], errors="coerce")
-    silver["quantity"] = pd.to_numeric(
-        silver["quantity"].replace({"Two": "2", "two": "2"}), errors="coerce"
-    )
-    silver["unit_price"] = pd.to_numeric(
-        silver["unit_price"].str.replace("$", "", regex=False), errors="coerce"
-    )
-    silver["discount_percent"] = pd.to_numeric(
-        silver["discount_pct"].str.replace("%", "", regex=False), errors="coerce"
-    ).fillna(0)
-    silver["tax_amount"] = pd.to_numeric(silver["tax_amount"], errors="coerce").fillna(0)
-    silver["channel"] = silver["channel"].str.strip().str.lower().map(
+    
+    # Execute query
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            order_id,
+            item_seq,
+            order_date as transaction_date,
+            customer_id,
+            COALESCE(customer_name, 'Unknown') as customer_name,
+            COALESCE(country, 'Unknown') as country,
+            COALESCE(state, 'Unknown') as state,
+            COALESCE(city, 'Unknown') as city,
+            product_id,
+            COALESCE(product_name, 'Unknown') as product_name,
+            category_code,
+            COALESCE(category_name, 'Unknown') as category_name,
+            brand_code,
+            COALESCE(brand_name, 'Unknown') as brand_name,
+            channel,
+            quantity,
+            unit_price,
+            discount_percent,
+            tax_amount,
+            currency as unit_price_currency,
+            gross_amount,
+            discount_amount,
+            net_amount,
+            revenue_inr
+        FROM ecommerce.gold.fact_transactions_denorm
+    """)
+    
+    # Fetch results into DataFrame
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    gold = pd.DataFrame(rows, columns=columns)
+    
+    cursor.close()
+    conn.close()
+    
+    load_seconds = perf_counter() - load_start
+    
+    # Convert date column
+    gold["transaction_date"] = pd.to_datetime(gold["transaction_date"])
+    
+    # Convert numeric columns
+    numeric_cols = ["quantity", "unit_price", "discount_percent", "tax_amount", 
+                   "gross_amount", "discount_amount", "net_amount", "revenue_inr"]
+    for col in numeric_cols:
+        if col in gold.columns:
+            gold[col] = pd.to_numeric(gold[col], errors="coerce")
+    
+    # Map channel names
+    gold["channel"] = gold["channel"].str.strip().str.lower().map(
         {"web": "Website", "app": "Mobile"}
-    )
-    silver["unit_price_currency"] = silver["unit_price_currency"].str.strip().str.upper()
-    silver = silver.dropna(
-        subset=[
-            "transaction_date",
-            "customer_id",
-            "order_id",
-            "product_id",
-            "quantity",
-            "unit_price",
-            "channel",
-        ]
-    )
-    silver_seconds = perf_counter() - silver_start
-
-    gold_start = perf_counter()
-    products = _read_csv(root / "products" / "products.csv", dtype=str)
-    brands = _read_csv(root / "brands" / "brands.csv", dtype=str)
-    categories = _read_csv(root / "category" / "category.csv", dtype=str)
-    customers = _read_csv(root / "customers" / "customers.csv", dtype=str)
-
-    for frame, columns in (
-        (products, ["category_code", "brand_code"]),
-        (brands, ["category_code", "brand_code"]),
-        (categories, ["category_code"]),
-    ):
-        for column in columns:
-            frame[column] = (
-                frame[column].fillna("").str.replace(r"[^A-Za-z0-9]", "", regex=True).str.upper()
-            )
-
-    brands["brand_name"] = brands["brand_name"].str.strip()
-    products["sku"] = products["sku"].str.strip()
-    categories["category_name"] = categories["category_name"].str.strip()
-    customers["country"] = customers["country"].str.strip()
-    customers["state"] = customers["state"].str.strip().str.upper()
-    customers["region"] = customers["state"].map(STATE_TO_REGION).fillna("Other")
-
-    brands = brands.drop_duplicates("brand_code", keep="first")
-    categories = categories.drop_duplicates("category_code", keep="first")
-    products = products.drop_duplicates("product_id", keep="first")
-    customers = customers.drop_duplicates("customer_id", keep="first")
-
-    product_dim = products.merge(
-        brands[["brand_code", "brand_name"]], on="brand_code", how="left", validate="many_to_one"
-    ).merge(
-        categories[["category_code", "category_name"]],
-        on="category_code",
-        how="left",
-        validate="many_to_one",
-    )
-
-    gold = silver.merge(
-        product_dim[
-            [
-                "product_id",
-                "sku",
-                "category_code",
-                "category_name",
-                "brand_code",
-                "brand_name",
-            ]
-        ],
-        on="product_id",
-        how="left",
-        validate="many_to_one",
-    ).merge(
-        customers[["customer_id", "country", "state", "region"]],
-        on="customer_id",
-        how="left",
-        validate="many_to_one",
-    )
-    gold["country"] = gold["country"].fillna("Unknown")
-    gold["state"] = gold["state"].fillna("Unknown")
-    gold["region"] = gold["region"].fillna("Unknown")
-
-    gold["gross_amount"] = gold["quantity"] * gold["unit_price"]
-    gold["discount_amount"] = np.ceil(
-        gold["gross_amount"] * gold["discount_percent"] / 100
-    )
-    gold["net_amount"] = gold["gross_amount"] - gold["discount_amount"] + gold["tax_amount"]
-    gold["inr_rate"] = gold["unit_price_currency"].map(FX_TO_INR)
-    gold["revenue_inr"] = np.ceil(gold["net_amount"] * gold["inr_rate"])
+    ).fillna(gold["channel"])
+    
+    # Add region mapping
+    gold["region"] = gold["state"].map(STATE_TO_REGION).fillna("Other")
+    
+    # Add computed columns
     gold["month"] = gold["transaction_date"].dt.to_period("M").astype(str)
-    gold["coupon_flag"] = gold["coupon_code"].notna().astype(int)
-    gold_seconds = perf_counter() - gold_start
-
+    gold["inr_rate"] = gold["unit_price_currency"].map(FX_TO_INR).fillna(1.0)
+    
+    # Create profile with simplified metrics
     profile = PipelineProfile(
-        file_count=len(order_files),
-        landing_rows=len(landing),
-        bronze_rows=len(landing),
-        silver_rows=len(silver),
+        file_count=1,  # Single table source
+        landing_rows=len(gold),
+        bronze_rows=len(gold),
+        silver_rows=len(gold),
         gold_rows=len(gold),
-        landing_seconds=landing_seconds,
-        silver_seconds=silver_seconds,
-        gold_seconds=gold_seconds,
+        landing_seconds=load_seconds,
+        silver_seconds=0.0,
+        gold_seconds=0.0,
         latest_business_date=gold["transaction_date"].max(),
         quality_issues={
-            "Duplicate order lines": duplicate_count,
-            "Text quantities normalized": text_quantity_count,
-            "Invalid prices rejected": invalid_price_count,
-            "Missing customer IDs": missing_customer_count,
-            "Rows rejected during cleaning": len(landing) - len(silver),
+            "Records loaded": len(gold),
+            "Missing customer names": int(gold["customer_name"].eq("Unknown").sum()),
+            "Missing locations": int(gold["country"].eq("Unknown").sum()),
         },
     )
+    
     return gold, profile
 
 
