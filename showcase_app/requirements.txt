@@ -2,4 +2,4 @@ streamlit==1.46.1
 pandas==2.2.3
 numpy==2.2.6
 plotly==6.1.2
-
+databricks-sql-connector>=3.5,<5

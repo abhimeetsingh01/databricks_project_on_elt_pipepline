@@ -87,7 +87,24 @@ def horizontal_bar(frame, x, y, color="#0f6b62", height=350):
     return fig
 
 
-data, profile = get_data()
+try:
+    data, profile = get_data()
+except Exception as exc:
+    st.error("The Databricks Gold model could not be loaded.")
+    st.markdown(
+        """
+        Check these before redeploying:
+
+        - SQL Warehouse is running.
+        - App has access to `ecommerce.gold.fact_transactions_denorm`.
+        - App environment variables are configured:
+          - `DATABRICKS_HOST`
+          - `DATABRICKS_WAREHOUSE_HTTP_PATH`
+        - `databricks-sql-connector` is installed from `requirements.txt`.
+        """
+    )
+    st.exception(exc)
+    st.stop()
 
 with st.sidebar:
     st.markdown("## E-commerce IQ")
